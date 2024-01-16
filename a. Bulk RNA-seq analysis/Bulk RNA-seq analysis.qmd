@@ -1,0 +1,434 @@
+---
+title: "GSEA analysis for CRC Fibroblast paper - (Menche, C & Schuhwerk, H. et al., 2024)"
+format: html
+editor: visual
+---
+
+# 1. Preparation
+## 1.1 Load libraries
+The following libraries are necessary for the GSEA analysis
+
+```{r}
+library(apeglm)
+library(clusterProfiler)
+library(data.table)
+library(DESeq2)
+library(dplyr)
+library(forcats)
+library(future)
+library(future.apply)
+library(ggpubr)
+library(here)
+library(magrittr)
+library(MAGeCKFlute)
+library(msigdbr)
+library(org.Mm.eg.db)
+library(pheatmap)
+library(PCAtools)
+library(RColorBrewer)
+library(readr)
+library(stringr)
+library(tximport)
+```
+
+## 1.2 Setup the comparisons
+This part is used to set up the required comparisons and verifies whether the count files necessary for the GSEA are present.
+
+```{r}
+# Create a list with all the conditions that will be compared with one another.
+name_list <- list(
+  Name = c("KOPBS_vs_KOIL24hrs_DE_results",
+           "KOPBS_vs_KOIL5hrs_DE_results",
+           "CtrlPBS-vsCtrlIL1a5hrs-DE_results",
+           "CtrlPBS-vsCtrlIL1a24hrs-DE_results",
+           "Ctrl_vs_KO_PBS_DE_results",
+           "Ctrl_vs_KO_IL1a_5hrs_DE_results",
+           "Ctrl_vs_KO_IL1a_24hrs_DE_results"),
+  colData = c("col-data-KOPBSvsKOIl24.txt",
+              "col-data-KOPBSvsKOIl5.txt",
+              "col-data-CtrlPBS-vsCtrlIL1a5hrs.txt",
+              "col-data-CtrlPBS-vsCtrlIL1a24hrs.txt",
+              "col-data-ctrl-vs-ko_PBS.txt",
+              "col-data-Ctrl_vs_KO-IL1a_5hrs.txt",
+              "col-data-Ctrl_KO-IL1a-24hrs.txt"),
+  condition = c("KO_IL1a_24h_vs_KO_PBS_24h",
+                "KO_IL1a_5h_vs_KO_PBS_24h",
+                "Ctrl_IL1a_5h_vs_Ctrl_PBS_24h",
+                "Ctrl_IL1a_24h_vs_Ctrl_PBS_24h",
+                "KO_PBS_24h_vs_Ctrl_PBS_24h",
+                "KO_IL1a_5h_vs_Ctrl_IL1a_5h",
+                "KO_IL1a_24h_vs_Ctrl_IL1a_24h")
+)
+
+# Define the path to the results folder using the 'here' package.
+results_folder <- here::here("2_Results", "Yussuf")
+
+# Check whether the count files
+for (i in seq_along(name_list$Name)) {
+  file_path <- file.path(results_folder, name_list$Name[[i]], name_list$colData[[i]])
+  file_exists <- file.exists(file_path)
+  cat(sprintf("File %s exists: %s\n", basename(file_path), toString(file_exists)))
+}
+
+```
+
+# 2. DEG analysis
+```{r}
+run_DEG <- function(name_list) {
+  #1. Print which analysis is performed
+  print(paste0("The analysis for ", name_list[["Name"]], "_", name_list[["colData"]]))
+  
+  #2. Import  the right quant.sf files for DEG using DESeq2
+  a <- read.table(here::here("2_Results", "Yussuf", name_list$Name, name_list$colData),
+                  sep = "\t",
+                  header = TRUE)
+
+  pull(a, 'X')
+  
+  sample_files <- paste0(here::here("1_Input",
+                                    pull(a, 'X'),
+                                    'quant.sf'))
+
+  ##To add names
+  names(sample_files) =  pull(a, 'X')
+  sample_files
+  
+  ##To change the transcript name to gene name, you need a two column table
+  gene = read.table(here::here("1_Input", "salmon_tx2gene.tsv"), header = F)
+  gene1 <- gene[, c(1, 2)]
+  
+  
+  ##Import the .sf files, and creat a count matrics from salmon
+  count_data <- tximport(files = sample_files,
+                         type = "salmon",
+                         tx2gene = gene1)
+  
+  ##Coldata for DESeq2
+  info <- a
+
+  ##Link the samples with the count matrix
+  dds <- DESeqDataSetFromTximport(txi = count_data,
+                                  colData = a,
+                                  design = ~ condition)
+  
+  
+  ##Filtering counts, removing genes when sum of counts in a group is lower than 10. 
+  smallestGroupSize <- dplyr::count(a, condition) |>
+    pull(n) |>
+    min()
+  
+  keep <- rowSums(counts(dds) >= 10) >= smallestGroupSize
+  dds <- dds[keep, ]
+
+  ##Main DEseq2 analysis
+  dds$condition <- relevel(dds$condition,
+                           str_extract(name_list$condition, "(?<=_vs_).*")[[1]])
+  ddsDE <- DESeq(dds)
+  
+  resultsNames(ddsDE)
+  result <- results(ddsDE, alpha = 0.05)
+
+  ## Shrink log2FoldChanges, to remove the noise associated with log2FoldChanges from low count genes without requiring arbitrary filtering thresholds.
+  
+  result <- lfcShrink(ddsDE,
+                      coef = paste0("condition_", name_list[["condition"]]),
+                      type = "apeglm")
+
+  resOrdered <- result[order(result$padj), ]
+
+  ##Annotation
+  resOrdered$ensembl <- sapply(strsplit(rownames(resOrdered),
+                                        split = "\\+"), "[", 1)
+
+  resOrdered$entrez <- TransGeneID(resOrdered$ensembl,
+                                   fromType = "ensembl",
+                                   toType = "Entrez",
+                                   organism = "mmu",
+                                   fromOrg = "mmu",
+                                   toOrg = "mmu")
+  return(resOrdered)
+}
+
+```
+
+
+# 3. GSEA analysis
+## 3.1 Input preparation
+To perform the GSEA we need a sorted vector with values of log2FoldChanges and Entrez gene IDs.
+
+```{r}
+# The prepare_GSEA function creates a vector, with log2FoldChange as values and the Entrez gene name as name. 
+prepare_GSEA <- function(results) {
+  # 1. Remove NAs and duplicates, retaining the entry with the highest 'log2FoldChange'.
+  results <- results |>
+    as.data.table() |>
+    dplyr::filter(!is.na(entrez)) |>
+    dplyr::filter(!duplicated(entrez)) |> 
+    group_by(entrez) |>
+    arrange(desc((log2FoldChange))) |>
+    mutate(entrez = as.character(entrez)) |>
+    distinct()
+
+  # 2. Creating a vector named 'genelist' with log2FoldChange values.
+  genelist <- results[["log2FoldChange"]]
+  names(genelist) <- results[["entrez"]]
+  
+  # 3. The function returns the 'genelist', now prepared for GSEA.
+  return(genelist)
+}
+```
+
+## 3.2 Retrieve and prepare MSigDB and custom gene sets
+
+```{r}
+# 1. Retrieving gene sets from the Molecular Signatures Database (MSigDB) for "Mus musculus" (mouse).
+# The data is then filtered to include only gene set names ('gs_name') and corresponding Entrez gene IDs ('entrez_gene').
+m_t2g <- msigdbr(species = "Mus musculus") |>
+  dplyr::select(gs_name, entrez_gene)
+
+#2. Retrieving custom gene sets, present in the Input folder.
+# List the GMT files
+gmt_files <- list.files(path = here::here("1_Input", "GMT"),
+                        pattern = "\\.gmt$",
+                        full.names = T)
+
+# Read the GMT files
+gmt_list <- list()
+for (i in 1:length(gmt_files)) {
+  basename = basename(gmt_files)[[i]]
+  gmt_list[[i]] <- read.gmt(gmt_files[[i]])
+}
+
+# Convert gene symbols to Entrez IDs
+gmt_list <- rbindlist(gmt_list)
+gmt_list$entrez <- TransGeneID(gmt_list$gene, 
+                               fromType = "symbol",
+                               toType = "Entrez",
+                               organism = "mmu",
+                               fromOrg = "mmu", 
+                               toOrg = "mmu")
+
+# Prepare final vector for GSEA analysis
+gmt_list_final <- gmt_list |>
+  dplyr::select(term, entrez) |>
+  dplyr::rename(gene = entrez)
+
+```
+
+## 3.3 GSEA functions
+Now we can perform the GSEA. 
+Sometimes there are no enriched terms present, hence we incorporated error handling.
+
+```{r}
+#1. GSEA analyses
+#1.1 MSIGDB - All pathways
+run_GSEA_MSIGDB <- function(results){
+  genelist <- prepare_GSEA(results)
+  gsea <- GSEA(genelist, TERM2GENE = m_t2g)
+  return(gsea)
+  
+}
+
+#1.2 KEGG - Pathways
+run_GSEA_KEGG <- function(results){
+  genelist <- prepare_GSEA(results)
+  gsea <- gseKEGG(geneList = genelist,
+                  organism = "mmu",
+                  minGSSize = 5, 
+                  pvalueCutoff = 0.1, 
+                  verbose = FALSE)
+  return(gsea)
+}
+
+#1.3 GO - Pathways
+run_GSEA_GO <- function(results, ontology){
+  genelist <- prepare_GSEA(results)
+  
+  gsea <- gseGO(geneList = genelist,
+                OrgDb = org.Mm.eg.db,
+                ont = ontology,
+                minGSSize = 100,
+                maxGSSize = 500,
+                pvalueCutoff = 0.05,
+                verbose = FALSE)
+  return(gsea)
+}
+
+#1.4 - Custom pathways
+run_GSEA_custom <- function(results){
+  genelist <- prepare_GSEA(results)
+  gsea <- GSEA(genelist, TERM2GENE = gmt_list_final)
+  return(gsea)
+  
+}
+
+#2 - Run the GSEA analysis, including error handling.
+perform_GSEA <- function(results){
+  # Initialize an empty list to store results
+  results_list <- list()  
+  # 1. MSIGDB
+  tryCatch(
+    {
+      results_list[["MSIGDB"]] <- run_GSEA_MSIGDB(results)
+    },
+    error = function(e) {
+      cat("Error in MSIGDB GSEA:", conditionMessage(e), "\n")
+    }
+  )
+
+  # 2. KEGG
+  tryCatch(
+    {
+      results_list[["KEGG"]] <- run_GSEA_KEGG(results)
+    },
+    error = function(e) {
+      cat("Error in KEGG GSEA:", conditionMessage(e), "\n")
+    }
+  )
+
+  # 3. GO
+  # 3.1 GO - CC
+  tryCatch(
+    {
+      results_list[["GO_CC"]] <- run_GSEA_GO(results, ontology = "CC")
+    },
+    error = function(e) {
+      cat("Error in GO - CC GSEA:", conditionMessage(e), "\n")
+    }
+  )
+
+  # 3.2 GO - BP
+  tryCatch(
+    {
+      results_list[["GO_BP"]] <- run_GSEA_GO(results, ontology = "BP")
+    },
+    error = function(e) {
+      cat("Error in GO - BP GSEA:", conditionMessage(e), "\n")
+    }
+  )
+
+  # 3.3 GO - MF
+  tryCatch(
+    {
+      results_list[["GO_MF"]] <- run_GSEA_GO(results, ontology = "MF")
+    },
+    error = function(e) {
+      cat("Error in GO - MF GSEA:", conditionMessage(e), "\n")
+    }
+  )
+
+  # 4. Custom gene sets
+  tryCatch(
+    {
+      results_list[["custom"]] <- run_GSEA_custom(results)
+    },
+    error = function(e) {
+      cat("Error in Custom GSEA:", conditionMessage(e), "\n")
+    }
+  )
+  return(results_list)
+}
+```
+
+## 3.4 GSEA plot functions
+Grabs the GSEA results and creates the GSEA plots.
+Included parallelization, to speed up the process.
+
+### 3.4.1 Include NES, pvalue and p.adjust into the final GSEA figures
+Solution acquired from https://www.biostars.org/p/9470087/ by user: lianchee11
+
+```{r}
+# trace("gseaplot2", edit = TRUE)
+# if (pvalue_table) {
+# pd <- x[geneSetID, c("NES", "pvalue", "p.adjust")]
+# rownames(pd) <- ""
+# pd <- pd[, ]
+```
+
+## 3.5 Plot and save GSEA results
+```{r}
+# Set up parallel processing
+plan(multisession)
+
+plot_and_save <- function(results_list, name_list) {
+  names <- names(results_list)
+  
+  # Define the function to apply in parallel
+  process_results <- function(name) {
+    results <- results_list[[name]]
+    length_results <- length(results@result$ID)
+    if (length_results >= 1) {
+      results_readable <- setReadable(results, OrgDb = "org.Mm.eg.db", keyType = "ENTREZID")
+      result_table <- results_readable %>% 
+        as.data.table()
+      
+      fwrite(x = result_table,
+             file = here::here("2_Results", name_list[["condition"]], name, "GSEA_Table.txt"),
+             sep = "\t",
+             quote = F)
+      
+      for (x in 1:length_results) {
+        enriched_description <- results_readable@result$Description[[x]]
+        plot <- gseaplot2(results_readable,
+                          geneSetID = x,
+                          title = enriched_description,
+                          pvalue_table = TRUE)
+        
+        ggsave(filename = paste0(x, "_", enriched_description, ".jpeg"),
+               plot = plot,
+               path = here::here("2_Results", name_list[["condition"]], name),
+               device = "jpeg",
+               dpi = 300,
+               width = 6,
+               height = 4)
+      }
+    } else {
+      # Handle out-of-bounds index
+      print("Index out of bounds")
+    }
+  }
+  
+  # Apply the function in parallel
+  future_mapply(process_results, name = names)
+}
+```
+
+
+# 4. Run GSEA analysis
+```{r}
+run_analysis <- function(name_list) {
+
+  DEG_results <- run_DEG(name_list)  
+
+  ## Create directories for GSEA
+  directories <- c("2_Results",
+                   here::here("2_Results", name_list$condition),
+                   here::here("2_Results", name_list$condition, "MSIGDB"),
+                   here::here("2_Results", name_list$condition, "KEGG"),
+                   here::here("2_Results", name_list$condition, "GO_CC"),
+                   here::here("2_Results", name_list$condition, "GO_MF"),
+                   here::here("2_Results", name_list$condition, "GO_BP"),
+                   here::here("2_Results", name_list$condition, "custom"))
+  
+  lapply(directories, dir.create, showWarnings = F)
+  
+  
+  #2. Perform GSEA
+  results_list <- list()
+  results_list <- perform_GSEA(DEG_results)
+  plot_and_save(results_list, name_list)
+  
+}
+
+
+
+for (i in 1:7) {
+  namelist = list(Name = name_list$Name[[i]],
+                  colData = name_list$colData[[i]],
+                  condition = name_list$condition[[i]])
+  run_analysis(namelist)
+}
+
+```
+
+
